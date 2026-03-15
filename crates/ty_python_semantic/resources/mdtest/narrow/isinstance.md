@@ -245,7 +245,7 @@ import typing as t
 
 def f(x: dict[str, int] | list[str], y: object):
     if isinstance(x, t.Dict):
-        reveal_type(x)  # revealed: dict[str, int]
+        reveal_type(x)  # revealed: (dict[str, int] & dict[Any, Any]) | (dict[str, int] & Top[TypedDict])
     else:
         reveal_type(x)  # revealed: list[str]
 
@@ -662,9 +662,8 @@ def _(x: Invariant[int] | Covariant[str]):
         reveal_type(x)  # revealed: Covariant[str] & ~Top[Invariant[Unknown]]
 ```
 
-For dict-like runtime checks, we include `Top[TypedDict]` alongside the ordinary top dict-like
-constraint when it contributes additional information. For `Mapping`, that extra arm simplifies away
-because `TypedDict` is already statically compatible there:
+For dict-like runtime checks, we use runtime-safe dict-like constraints and include `Top[TypedDict]`
+when `TypedDict` also runtime-matches the `classinfo` argument:
 
 ```py
 from collections.abc import Mapping, MutableMapping
@@ -675,13 +674,13 @@ class Movie(TypedDict):
 
 def _(x: object, y: Movie):
     if isinstance(x, dict):
-        reveal_type(x)  # revealed: Top[dict[Unknown, Unknown]] | Top[TypedDict]
+        reveal_type(x)  # revealed: dict[Any, Any] | Top[TypedDict]
 
     if isinstance(x, Mapping):
-        reveal_type(x)  # revealed: Top[Mapping[Unknown, object]]
+        reveal_type(x)  # revealed: Mapping[Any, Any] | Top[TypedDict]
 
     if isinstance(x, MutableMapping):
-        reveal_type(x)  # revealed: Top[MutableMapping[Unknown, Unknown]] | Top[TypedDict]
+        reveal_type(x)  # revealed: MutableMapping[Any, Any] | Top[TypedDict]
 
     if isinstance(y, dict):
         reveal_type(y)  # revealed: Movie
@@ -704,7 +703,7 @@ def _(z: int | Movie):
         reveal_type(z)  # revealed: int
 ```
 
-When a gradual arm remains after narrowing, that `Top[TypedDict]` fallback remains visible too.
+When a gradual arm remains after narrowing, both fallback arms stay visible too.
 
 ```py
 from typing import TypeVar
@@ -713,7 +712,56 @@ T = TypeVar("T")
 
 def _(value: Movie | T):
     if isinstance(value, dict):
-        reveal_type(value)  # revealed: Movie | (T@_ & Top[dict[Unknown, Unknown]]) | (T@_ & Top[TypedDict])
+        reveal_type(value)  # revealed: Movie | (T@_ & dict[Any, Any]) | (T@_ & Top[TypedDict])
+```
+
+This also needs to preserve common dict-key correlations from ecosystem code:
+
+```py
+def compare_common_keys(value: object, default: object):
+    if isinstance(value, dict) and isinstance(default, dict):
+        reveal_type(value)  # revealed: dict[Any, Any] | Top[TypedDict]
+        for key in value.keys() & default.keys():
+            reveal_type(key)  # revealed: Any | str
+            reveal_type(value[key])  # revealed: object
+            reveal_type(default[key])  # revealed: object
+            reveal_type(default.get(key))  # revealed: object
+```
+
+It should also keep `dict` methods callable for concrete `dict` unions keyed by `IntEnum` values:
+
+```py
+from enum import IntEnum
+from typing import Dict, Optional, Protocol, Union
+
+class DiagnosticField(IntEnum):
+    MESSAGE = 77
+
+class PGresult(Protocol):
+    def error_field(self, fieldcode: int) -> Optional[bytes]: ...
+
+ErrorInfo = Union[PGresult, Dict[int, Optional[bytes]], None]
+
+def _(info: ErrorInfo):
+    if isinstance(info, dict):
+        reveal_type(info)  # revealed: (PGresult & dict[Any, Any]) | (dict[int, bytes | None] & dict[Any, Any])
+        reveal_type(info.get(DiagnosticField.MESSAGE))  # revealed: Any | None
+    elif info:
+        reveal_type(info)  # revealed: PGresult & ~Top[dict[Unknown, Unknown]] & ~AlwaysFalsy
+        reveal_type(info.error_field(DiagnosticField.MESSAGE))  # revealed: bytes | None
+```
+
+But plain-dict mutation APIs should still be rejected when the narrowed value may be a `TypedDict`:
+
+```py
+def takes_dict(value: dict[str, object]) -> None: ...
+def mutate_dict_like(value: object) -> None:
+    if isinstance(value, dict):
+        reveal_type(value)  # revealed: dict[Any, Any] | Top[TypedDict]
+        value.setdefault("name", {})  # error: [invalid-argument-type]
+        value["name"] = {}  # error: [invalid-assignment]
+        value.popitem()  # error: [unresolved-attribute]
+        takes_dict(value)  # error: [invalid-argument-type]
 ```
 
 The behavior of `issubclass()` is similar.
@@ -797,13 +845,13 @@ def narrow_single_typeddict(x: list | A) -> None:
 
 def narrow_mutable_mapping_or_typeddict(x: dict[str, str] | A) -> None:
     if isinstance(x, MutableMapping):
-        reveal_type(x)  # revealed: dict[str, str] | A
+        reveal_type(x)  # revealed: (dict[str, str] & MutableMapping[Any, Any]) | A | (dict[str, str] & Top[TypedDict])
     else:
         reveal_type(x)  # revealed: Never
 
 def narrow_dict_or_typeddict(x: dict[str, str] | A) -> None:
     if isinstance(x, dict):
-        reveal_type(x)  # revealed: dict[str, str] | A
+        reveal_type(x)  # revealed: (dict[str, str] & dict[Any, Any]) | A | (dict[str, str] & Top[TypedDict])
     else:
         reveal_type(x)  # revealed: Never
 

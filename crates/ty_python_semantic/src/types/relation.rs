@@ -2012,6 +2012,23 @@ impl<'a, 'c, 'db> DisjointnessChecker<'a, 'c, 'db> {
                 })
             }
 
+            (Type::ProtocolInstance(protocol), Type::TypedDictTop)
+            | (Type::TypedDictTop, Type::ProtocolInstance(protocol)) => {
+                self.with_recursion_guard(left, right, || {
+                    self.any_protocol_members_absent_or_disjoint(
+                        db,
+                        protocol,
+                        KnownClass::TypedDictFallback.to_instance(db),
+                    )
+                })
+            }
+
+            (Type::ProtocolInstance(protocol), typed_dict @ Type::TypedDict(_))
+            | (typed_dict @ Type::TypedDict(_), Type::ProtocolInstance(protocol)) => self
+                .with_recursion_guard(left, right, || {
+                    self.any_protocol_members_absent_or_disjoint(db, protocol, typed_dict)
+                }),
+
             (Type::ProtocolInstance(protocol), other)
             | (other, Type::ProtocolInstance(protocol)) => {
                 self.with_recursion_guard(left, right, || {
