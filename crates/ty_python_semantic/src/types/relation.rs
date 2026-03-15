@@ -2324,17 +2324,16 @@ impl<'a, 'c, 'db> DisjointnessChecker<'a, 'c, 'db> {
             (Type::TypedDictTop | Type::TypedDict(_), Type::TypedDictTop)
             | (Type::TypedDictTop, Type::TypedDict(_)) => self.never(),
 
-            // For any type `T`, if `dict[str, Any]` is not assignable to `T`, then all `TypedDict`
-            // types will always be disjoint from `T`. This doesn't cover all cases -- in fact
-            // `dict` *itself* is almost always disjoint from `TypedDict` -- but it's a good
-            // approximation, and some false negatives are acceptable.
+            // Other than the special cases enumerated above,
+            // a typeddict type is always disjoint from any type that is not
+            // a supertype of `Top[Mapping[str, Any]]`.
             (Type::TypedDictTop | Type::TypedDict(_), other)
             | (other, Type::TypedDictTop | Type::TypedDict(_)) => {
-                let dict_str_any = KnownClass::Dict
+                let mapping_str_any = KnownClass::Mapping
                     .to_specialized_instance(db, &[KnownClass::Str.to_instance(db), Type::any()]);
 
                 self.as_relation_checker(TypeRelation::Assignability)
-                    .check_type_pair(db, dict_str_any, other)
+                    .check_type_pair(db, mapping_str_any, other)
                     .negate(db, self.constraints)
             }
         }

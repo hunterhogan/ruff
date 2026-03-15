@@ -5119,6 +5119,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             })
             .flatten()
             .collect::<Vec<_>>();
+        let specialize_parameter_types_from_return_tcx = overloads_with_binding.len() == 1;
 
         // Each type is a valid independent inference of the given argument, and we may require
         // different permutations of argument types to correctly perform argument expansion during
@@ -5177,7 +5178,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     let mut builder =
                         SpecializationBuilder::new(db, generic_context.inferable_typevars(db));
 
-                    if let Some(declared_return_ty) = call_expression_tcx.annotation {
+                    if specialize_parameter_types_from_return_tcx
+                        && let Some(declared_return_ty) = call_expression_tcx.annotation
+                    {
                         let _ = builder.infer_reverse(
                             &constraints,
                             declared_return_ty,

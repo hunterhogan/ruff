@@ -155,12 +155,7 @@ impl ClassInfoConstraintFunction {
     ) -> Option<Type<'db>> {
         let constraint_from_class_literal = |class: ClassLiteral<'db>| match self {
             ClassInfoConstraintFunction::IsInstance => {
-                let constraint = if is_positive {
-                    runtime_isinstance_constraint(db, class)
-                        .unwrap_or_else(|| Type::instance(db, class.top_materialization(db)))
-                } else {
-                    Type::instance(db, class.top_materialization(db))
-                };
+                let constraint = Type::instance(db, class.top_materialization(db));
                 if class_literal_matches_typed_dict_runtime_supertype(db, class) {
                     UnionBuilder::new(db)
                         .add(constraint)
@@ -317,37 +312,6 @@ impl ClassInfoConstraintFunction {
     }
 }
 
-fn runtime_isinstance_constraint<'db>(
-    db: &'db dyn Db,
-    class: ClassLiteral<'db>,
-) -> Option<Type<'db>> {
-    if class.is_known(db, KnownClass::Dict) {
-        return Some(KnownClass::Dict.to_specialized_instance(db, &[Type::any(), Type::any()]));
-    }
-
-    if class.is_known(db, KnownClass::Mapping) {
-        return Some(KnownClass::Mapping.to_specialized_instance(db, &[Type::any(), Type::any()]));
-    }
-
-    let mutable_mapping = known_module_symbol(db, KnownModule::Typing, "MutableMapping")
-        .place
-        .ignore_possibly_undefined()
-        .and_then(Type::as_class_literal);
-    if let Some(mutable_mapping) = mutable_mapping
-        && class == mutable_mapping
-    {
-        return Some(Type::instance(
-            db,
-            mutable_mapping.apply_specialization(db, |generic_context| {
-                let len = generic_context.len(db);
-                generic_context.specialize(db, vec![Type::any(); len])
-            }),
-        ));
-    }
-
-    None
-}
-
 fn class_literal_matches_typed_dict_runtime_supertype<'db>(
     db: &'db dyn Db,
     class: ClassLiteral<'db>,
@@ -357,9 +321,7 @@ fn class_literal_matches_typed_dict_runtime_supertype<'db>(
         .ignore_possibly_undefined()
         .and_then(Type::as_class_literal);
 
-    class.is_known(db, KnownClass::Dict)
-        || class.is_known(db, KnownClass::Mapping)
-        || mutable_mapping == Some(class)
+    class.is_known(db, KnownClass::Dict) || mutable_mapping == Some(class)
 }
 
 #[derive(Hash, PartialEq, Debug, Eq, Clone, salsa::Update, get_size2::GetSize)]

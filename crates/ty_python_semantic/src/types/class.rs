@@ -10,8 +10,8 @@ pub(super) use self::named_tuple::{
 };
 pub(crate) use self::static_literal::StaticClassLiteral;
 use super::{
-    BoundTypeVarInstance, MemberLookupPolicy, MroIterator, SpecialFormType, SubclassOfType, Type,
-    TypeQualifiers, class_base::ClassBase, function::FunctionType,
+    BoundTypeVarInstance, MaterializationKind, MemberLookupPolicy, MroIterator, SpecialFormType,
+    SubclassOfType, Type, TypeQualifiers, class_base::ClassBase, function::FunctionType,
 };
 use super::{TypeVarVariance, display};
 use crate::place::{DefinedPlace, TypeOrigin};
@@ -1206,12 +1206,19 @@ impl<'db> ClassType<'db> {
     ) -> PlaceAndQualifiers<'db> {
         match self {
             Self::NonGeneric(class) => class.class_member(db, name, policy),
-            Self::Generic(generic) => generic.origin(db).class_member_inner(
-                db,
-                Some(generic.specialization(db)),
-                name,
-                policy,
-            ),
+            Self::Generic(generic) => {
+                let class_literal = generic.origin(db);
+                let specialization = generic.specialization(db);
+                let member_specialization = Self::top_materialized_dict_read_specialization(
+                    db,
+                    class_literal,
+                    specialization,
+                    name,
+                )
+                .unwrap_or(specialization);
+
+                class_literal.class_member_inner(db, Some(member_specialization), name, policy)
+            }
         }
     }
 
@@ -1542,16 +1549,51 @@ impl<'db> ClassType<'db> {
             }
             Self::Generic(generic) => {
                 let class_literal = generic.origin(db);
-                let specialization = Some(generic.specialization(db));
+                let specialization = generic.specialization(db);
 
                 if class_literal.is_typed_dict(db) {
                     return Place::Undefined.into();
                 }
 
+                let member_specialization = Self::top_materialized_dict_read_specialization(
+                    db,
+                    class_literal,
+                    specialization,
+                    name,
+                )
+                .unwrap_or(specialization);
+
                 class_literal
-                    .instance_member(db, specialization, name)
-                    .map_type(|ty| ty.apply_optional_specialization(db, specialization))
+                    .instance_member(db, Some(member_specialization), name)
+                    .map_type(|ty| {
+                        ty.apply_optional_specialization(db, Some(member_specialization))
+                    })
             }
+        }
+    }
+
+    fn top_materialized_dict_read_specialization(
+        db: &'db dyn Db,
+        class_literal: StaticClassLiteral<'db>,
+        specialization: Specialization<'db>,
+        name: &str,
+    ) -> Option<Specialization<'db>> {
+        if specialization.materialization_kind(db) != Some(MaterializationKind::Top)
+            || !class_literal.is_known(db, KnownClass::Dict)
+            || !specialization.types(db).iter().all(Type::is_unknown)
+            || !matches!(
+                name,
+                "__getitem__" | "__iter__" | "get" | "items" | "keys" | "values"
+            )
+        {
+            return None;
+        }
+
+        match class_literal.unknown_specialization(db) {
+            ClassType::Generic(unknown_specialization) => {
+                Some(unknown_specialization.specialization(db))
+            }
+            ClassType::NonGeneric(_) => None,
         }
     }
 
