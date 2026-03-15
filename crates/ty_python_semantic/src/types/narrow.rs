@@ -134,7 +134,7 @@ fn all_negative_narrowing_constraints_for_pattern<'db>(
 ///
 /// A "classinfo" argument is either a class or a tuple of classes, or a tuple of tuples of classes
 /// (etc. for arbitrary levels of recursion)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::Update, get_size2::GetSize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ClassInfoConstraintFunction {
     /// `builtins.isinstance`
     IsInstance,
@@ -143,12 +143,17 @@ pub enum ClassInfoConstraintFunction {
 }
 
 impl ClassInfoConstraintFunction {
-    fn classinfo_constraint_for_class_literal<'db>(
+    /// Generate a constraint from the type of a `classinfo` argument to `isinstance` or `issubclass`.
+    ///
+    /// The `classinfo` argument can be a class literal, a tuple of (tuples of) class literals. PEP 604
+    /// union types are not yet supported. Returns `None` if the `classinfo` argument has a wrong type.
+    fn generate_constraint<'db>(
         self,
         db: &'db dyn Db,
-        class: ClassLiteral<'db>,
-    ) -> Type<'db> {
-        match self {
+        classinfo: Type<'db>,
+        is_positive: bool,
+    ) -> Option<Type<'db>> {
+        let constraint_from_class_literal = |class: ClassLiteral<'db>| match self {
             ClassInfoConstraintFunction::IsInstance => {
                 let constraint = Type::instance(db, class.top_materialization(db));
                 if class_literal_matches_typed_dict_runtime_supertype(db, class) {
@@ -163,24 +168,13 @@ impl ClassInfoConstraintFunction {
             ClassInfoConstraintFunction::IsSubclass => {
                 SubclassOfType::from(db, class.top_materialization(db))
             }
-        }
-    }
+        };
 
-    /// Generate a constraint from the type of a `classinfo` argument to `isinstance` or `issubclass`.
-    ///
-    /// The `classinfo` argument can be a class literal, a tuple of (tuples of) class literals. PEP 604
-    /// union types are not yet supported. Returns `None` if the `classinfo` argument has a wrong type.
-    fn analyze_classinfo<'db>(
-        self,
-        db: &'db dyn Db,
-        classinfo: Type<'db>,
-        is_positive: bool,
-    ) -> Option<Type<'db>> {
         match classinfo {
-            Type::TypeAlias(alias) => self.analyze_classinfo(db, alias.value_type(db), is_positive),
-            Type::ClassLiteral(class_literal) => {
-                Some(self.classinfo_constraint_for_class_literal(db, class_literal))
+            Type::TypeAlias(alias) => {
+                self.generate_constraint(db, alias.value_type(db), is_positive)
             }
+            Type::ClassLiteral(class_literal) => Some(constraint_from_class_literal(class_literal)),
             Type::SubclassOf(subclass_of_ty) => {
                 // We can't narrow negatively from a `SubclassOf` type. `if !isinstance(x, y)`
                 // where `y: type[A]` doesn't ensure that `x` is not an instance of `A`, because
@@ -191,7 +185,7 @@ impl ClassInfoConstraintFunction {
 
                 match subclass_of_ty.subclass_of() {
                     SubclassOfInner::Class(ClassType::NonGeneric(class_literal)) => {
-                        Some(self.classinfo_constraint_for_class_literal(db, class_literal))
+                        Some(constraint_from_class_literal(class_literal))
                     }
                     // It's not valid to use a generic alias as the second argument to `isinstance()` or `issubclass()`,
                     // e.g. `isinstance(x, list[int])` fails at runtime.
@@ -210,7 +204,7 @@ impl ClassInfoConstraintFunction {
                 if intersection.negative(db).is_empty() {
                     let mut builder = IntersectionBuilder::new(db);
                     for element in intersection.positive(db) {
-                        builder = builder.add_positive(self.analyze_classinfo(
+                        builder = builder.add_positive(self.generate_constraint(
                             db,
                             *element,
                             is_positive,
@@ -222,20 +216,16 @@ impl ClassInfoConstraintFunction {
                     None
                 }
             }
-            Type::Union(union) => {
-                let mut builder = UnionBuilder::new(db);
-                for element in union.elements(db) {
-                    builder = builder.add(self.analyze_classinfo(db, *element, is_positive)?);
-                }
-                Some(builder.build())
-            }
+            Type::Union(union) => union.try_map(db, |element| {
+                self.generate_constraint(db, *element, is_positive)
+            }),
             Type::TypeVar(bound_typevar) => {
                 match bound_typevar.typevar(db).bound_or_constraints(db)? {
                     TypeVarBoundOrConstraints::UpperBound(bound) => {
-                        self.analyze_classinfo(db, bound, is_positive)
+                        self.generate_constraint(db, bound, is_positive)
                     }
                     TypeVarBoundOrConstraints::Constraints(constraints) => {
-                        self.analyze_classinfo(db, constraints.as_type(db), is_positive)
+                        self.generate_constraint(db, constraints.as_type(db), is_positive)
                     }
                 }
             }
@@ -245,45 +235,48 @@ impl ClassInfoConstraintFunction {
             Type::GenericAlias(_) => None,
 
             Type::NominalInstance(nominal) => nominal.tuple_spec(db).and_then(|tuple| {
-                let mut builder = UnionBuilder::new(db);
-                for element in tuple.iter_all_elements() {
-                    builder = builder.add(self.analyze_classinfo(db, element, is_positive)?);
-                }
-                Some(builder.build())
+                UnionType::try_from_elements(
+                    db,
+                    tuple
+                        .iter_all_elements()
+                        .map(|element| self.generate_constraint(db, element, is_positive)),
+                )
             }),
 
             Type::KnownInstance(KnownInstanceType::UnionType(instance)) => {
-                let mut builder = UnionBuilder::new(db);
-                for element in instance.value_expression_types(db).ok()? {
-                    let constraint = if element.is_none(db) {
+                UnionType::try_from_elements(
+                    db,
+                    instance.value_expression_types(db).ok()?.map(|element| {
                         // A special case is made for `None` at runtime
                         // (it's implicitly converted to `NoneType` in `int | None`)
                         // which means that `isinstance(x, int | None)` works even though
                         // `None` is not a class literal.
-                        self.analyze_classinfo(
-                            db,
-                            KnownClass::NoneType.to_class_literal(db),
-                            is_positive,
-                        )
-                    } else {
-                        self.analyze_classinfo(db, element, is_positive)
-                    }?;
-                    builder = builder.add(constraint);
-                }
-                Some(builder.build())
+                        if element.is_none(db) {
+                            self.generate_constraint(
+                                db,
+                                KnownClass::NoneType.to_class_literal(db),
+                                is_positive,
+                            )
+                        } else {
+                            self.generate_constraint(db, element, is_positive)
+                        }
+                    }),
+                )
             }
 
             Type::SpecialForm(form) => match form {
-                SpecialFormType::LegacyStdlibAlias(alias) => self.analyze_classinfo(
+                SpecialFormType::LegacyStdlibAlias(alias) => self.generate_constraint(
                     db,
                     alias.aliased_class().to_class_literal(db),
                     is_positive,
                 ),
-                SpecialFormType::Tuple => {
-                    self.analyze_classinfo(db, KnownClass::Tuple.to_class_literal(db), is_positive)
-                }
+                SpecialFormType::Tuple => self.generate_constraint(
+                    db,
+                    KnownClass::Tuple.to_class_literal(db),
+                    is_positive,
+                ),
                 SpecialFormType::Type => {
-                    self.analyze_classinfo(db, KnownClass::Type.to_class_literal(db), is_positive)
+                    self.generate_constraint(db, KnownClass::Type.to_class_literal(db), is_positive)
                 }
 
                 // We don't have a good meta-type for `Callable`s right now,
@@ -1615,7 +1608,11 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
                 let function = function.into_classinfo_constraint_function()?;
 
                 function
-                    .analyze_classinfo(self.db, inference.expression_type(second_arg), is_positive)
+                    .generate_constraint(
+                        self.db,
+                        inference.expression_type(second_arg),
+                        is_positive,
+                    )
                     .map(|classinfo| {
                         NarrowingConstraints::from_iter([(
                             place,
@@ -1747,7 +1744,7 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         let place = self.expect_place(&subject);
 
         let mapping_type = ClassInfoConstraintFunction::IsInstance
-            .analyze_classinfo(
+            .generate_constraint(
                 self.db,
                 KnownClass::Mapping.to_class_literal(self.db),
                 is_positive,
