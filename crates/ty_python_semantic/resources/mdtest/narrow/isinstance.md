@@ -662,9 +662,9 @@ def _(x: Invariant[int] | Covariant[str]):
         reveal_type(x)  # revealed: Covariant[str] & ~Top[Invariant[Unknown]]
 ```
 
-For dict-like runtime checks, we only introduce the internal `TypedDictTop` fallback when the
-original value was already typed-dict-like. Plain `object` values should stay as ordinary
-`dict`/`Mapping`/`MutableMapping` instances:
+For dict-like runtime checks, we include `Top[TypedDict]` alongside the ordinary top dict-like
+constraint when it contributes additional information. For `Mapping`, that extra arm simplifies away
+because `TypedDict` is already statically compatible there:
 
 ```py
 from collections.abc import Mapping, MutableMapping
@@ -675,13 +675,13 @@ class Movie(TypedDict):
 
 def _(x: object, y: Movie):
     if isinstance(x, dict):
-        reveal_type(x)  # revealed: Top[dict[Unknown, Unknown]]
+        reveal_type(x)  # revealed: Top[dict[Unknown, Unknown]] | Top[TypedDict]
 
     if isinstance(x, Mapping):
         reveal_type(x)  # revealed: Top[Mapping[Unknown, object]]
 
     if isinstance(x, MutableMapping):
-        reveal_type(x)  # revealed: Top[MutableMapping[Unknown, Unknown]]
+        reveal_type(x)  # revealed: Top[MutableMapping[Unknown, Unknown]] | Top[TypedDict]
 
     if isinstance(y, dict):
         reveal_type(y)  # revealed: Movie
@@ -704,8 +704,7 @@ def _(z: int | Movie):
         reveal_type(z)  # revealed: int
 ```
 
-When a gradual arm remains after narrowing, it stays on the ordinary dict-like side of the
-constraint.
+When a gradual arm remains after narrowing, that `Top[TypedDict]` fallback remains visible too.
 
 ```py
 from typing import TypeVar
@@ -714,7 +713,7 @@ T = TypeVar("T")
 
 def _(value: Movie | T):
     if isinstance(value, dict):
-        reveal_type(value)  # revealed: Movie | (T@_ & Top[dict[Unknown, Unknown]])
+        reveal_type(value)  # revealed: Movie | (T@_ & Top[dict[Unknown, Unknown]]) | (T@_ & Top[TypedDict])
 ```
 
 The behavior of `issubclass()` is similar.

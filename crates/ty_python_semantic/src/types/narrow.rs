@@ -1,4 +1,5 @@
 use crate::Db;
+use crate::place::known_module_symbol;
 use crate::semantic_index::expression::Expression;
 use crate::semantic_index::place::{PlaceExpr, PlaceTable, PlaceTableBuilder, ScopedPlaceId};
 use crate::semantic_index::place_table;
@@ -31,6 +32,7 @@ use ruff_python_ast::{BoolOp, ExprBoolOp};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec, smallvec_inline};
 use std::collections::hash_map::Entry;
+use ty_module_resolver::KnownModule;
 
 /// A set of places that could possibly be narrowed by a predicate.
 ///
@@ -148,7 +150,15 @@ impl ClassInfoConstraintFunction {
     ) -> Type<'db> {
         match self {
             ClassInfoConstraintFunction::IsInstance => {
-                Type::instance(db, class.top_materialization(db))
+                let constraint = Type::instance(db, class.top_materialization(db));
+                if class_literal_matches_typed_dict_runtime_supertype(db, class) {
+                    UnionBuilder::new(db)
+                        .add(constraint)
+                        .add(Type::TypedDictTop)
+                        .build()
+                } else {
+                    constraint
+                }
             }
             ClassInfoConstraintFunction::IsSubclass => {
                 SubclassOfType::from(db, class.top_materialization(db))
@@ -307,6 +317,20 @@ impl ClassInfoConstraintFunction {
             | Type::NewTypeInstance(_) => None,
         }
     }
+}
+
+fn class_literal_matches_typed_dict_runtime_supertype<'db>(
+    db: &'db dyn Db,
+    class: ClassLiteral<'db>,
+) -> bool {
+    let mutable_mapping = known_module_symbol(db, KnownModule::Typing, "MutableMapping")
+        .place
+        .ignore_possibly_undefined()
+        .and_then(Type::as_class_literal);
+
+    class.is_known(db, KnownClass::Dict)
+        || class.is_known(db, KnownClass::Mapping)
+        || mutable_mapping == Some(class)
 }
 
 #[derive(Hash, PartialEq, Debug, Eq, Clone, salsa::Update, get_size2::GetSize)]

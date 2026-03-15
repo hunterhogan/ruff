@@ -1,10 +1,4 @@
-use itertools::Itertools;
-use ruff_python_ast::name::Name;
-use rustc_hash::FxHashSet;
-
-use ty_module_resolver::KnownModule;
-
-use crate::place::{DefinedPlace, Place, known_module_symbol};
+use crate::place::{DefinedPlace, Place};
 use crate::types::constraints::{
     ConstraintSetBuilder, IteratorConstraintsExtension, OptionConstraintsExtension,
 };
@@ -20,6 +14,9 @@ use crate::{
     Db,
     types::{Type, constraints::ConstraintSet, generics::InferableTypeVars},
 };
+use itertools::Itertools;
+use ruff_python_ast::name::Name;
+use rustc_hash::FxHashSet;
 
 /// A non-exhaustive enumeration of relations that can exist between types.
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
@@ -1190,12 +1187,6 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
 
             (Type::TypedDict(_) | Type::TypedDictTop, Type::TypedDictTop) => self.always(),
 
-            (Type::TypedDict(_) | Type::TypedDictTop, target)
-                if is_typed_dict_runtime_supertype_target(db, target) =>
-            {
-                self.always()
-            }
-
             // TODO: When we support `closed` and/or `extra_items`, we could allow assignments to other
             // compatible `Mapping`s. `extra_items` could also allow for some assignments to `dict`, as
             // long as `total=False`. (But then again, does anyone want a non-total `TypedDict` where all
@@ -1560,23 +1551,6 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             disjointness_visitor: self.disjointness_visitor,
         }
     }
-}
-
-fn is_typed_dict_runtime_supertype_target<'db>(db: &'db dyn Db, target: Type<'db>) -> bool {
-    let Type::NominalInstance(instance) = target else {
-        return false;
-    };
-
-    let class_literal = instance.class(db).class_literal(db);
-    let mutable_mapping = known_module_symbol(db, KnownModule::Typing, "MutableMapping")
-        .place
-        .ignore_possibly_undefined()
-        .and_then(Type::as_class_literal);
-
-    (class_literal.is_known(db, KnownClass::Dict)
-        || class_literal.is_known(db, KnownClass::Mapping)
-        || mutable_mapping == Some(class_literal))
-        && target == Type::instance(db, class_literal.top_materialization(db))
 }
 
 pub(super) struct EquivalenceChecker<'a, 'c, 'db> {
