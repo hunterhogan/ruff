@@ -5254,7 +5254,7 @@ impl<'db> Type<'db> {
             }
 
             Type::NominalInstance(instance) => {
-                instance.apply_type_mapping_impl(db, type_mapping, tcx, visitor)
+                visitor.visit(self, || instance.apply_type_mapping_impl(db, type_mapping, tcx, visitor))
             },
 
             Type::NewTypeInstance(newtype) => visitor.visit(self, || {

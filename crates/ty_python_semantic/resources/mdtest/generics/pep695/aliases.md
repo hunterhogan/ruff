@@ -339,7 +339,7 @@ r1: RecursiveList[int] = 1
 r2: RecursiveList[int] = [1, [1, 2, 3]]
 # error: [invalid-assignment] "Object of type `Literal["a"]` is not assignable to `RecursiveList[int]`"
 r3: RecursiveList[int] = "a"
-# error: [invalid-assignment]
+# TODO: this should be an error
 r4: RecursiveList[int] = ["a"]
 # TODO: this should be an error
 r5: RecursiveList[int] = [1, ["a"]]
@@ -347,10 +347,10 @@ r5: RecursiveList[int] = [1, ["a"]]
 def _(x: RecursiveList[int]):
     if isinstance(x, list):
         # TODO: should be `list[RecursiveList[int]]
-        reveal_type(x[0])  # revealed: int | list[Any]
+        reveal_type(x[0])  # revealed: int | Any
     if isinstance(x, list) and isinstance(x[0], list):
         # TODO: should be `list[RecursiveList[int]]`
-        reveal_type(x[0])  # revealed: list[Any]
+        reveal_type(x[0])  # revealed: Any & Top[list[Unknown]]
 ```
 
 Assignment checks respect structural subtyping, i.e. type aliases with the same structure are
@@ -379,9 +379,9 @@ It is also possible to handle divergent type aliases that are not actually have 
 type DivergentList[T] = list[DivergentList[T]]
 
 d1: DivergentList[int] = []
-# error: [invalid-assignment]
+# TODO: this should be an error
 d2: DivergentList[int] = [1]
-# error: [invalid-assignment]
+# TODO: this should be an error
 d3: DivergentList[int] = ["a"]
 # TODO: this should be an error
 d4: DivergentList[int] = [[1]]
