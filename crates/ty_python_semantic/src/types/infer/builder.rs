@@ -6715,6 +6715,220 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         self.infer_call_expression_impl(call_expression, callable_type, tcx)
     }
 
+    fn infer_keyword_only_dict_call(
+        &mut self,
+        func: &ast::Expr,
+        arguments: &ast::Arguments,
+        call_expression_tcx: TypeContext<'db>,
+    ) -> Option<Type<'db>> {
+        if !arguments.args.is_empty()
+            || arguments
+                .keywords
+                .iter()
+                .any(|keyword| keyword.arg.is_none())
+        {
+            return None;
+        }
+
+        // Fast-path dict(...) in TypedDict context: infer keyword values against fields,
+        // then validate and return the TypedDict type.
+        if let Some(tcx) = call_expression_tcx.annotation
+            && let Some(typed_dict) = tcx
+                .filter_union(self.db(), Type::is_typed_dict)
+                .as_typed_dict()
+        {
+            let items = typed_dict.items(self.db());
+            for keyword in &arguments.keywords {
+                if let Some(arg_name) = &keyword.arg {
+                    let value_tcx = items
+                        .get(arg_name.id.as_str())
+                        .map(|field| TypeContext::new(Some(field.declared_ty)))
+                        .unwrap_or_default();
+                    self.infer_expression(&keyword.value, value_tcx);
+                }
+            }
+
+            validate_typed_dict_constructor(
+                &self.context,
+                typed_dict,
+                arguments,
+                func.into(),
+                |expr| self.expression_type(expr),
+            );
+
+            return Some(Type::TypedDict(typed_dict));
+        }
+
+        let items = arguments
+            .keywords
+            .iter()
+            .map(|keyword| [Some(&keyword.value), Some(&keyword.value)])
+            .collect_vec();
+        let keyword_names = arguments
+            .keywords
+            .iter()
+            .filter_map(|keyword| {
+                Some((
+                    keyword.value.node_index().load(),
+                    keyword.arg.as_ref()?.id.clone(),
+                ))
+            })
+            .collect::<FxHashMap<_, _>>();
+        let mut infer_elt_ty = |builder: &mut Self, (i, elt, tcx): ArgExpr<'db, '_>| {
+            if i == 0 {
+                let key = keyword_names
+                    .get(&elt.node_index().load())
+                    .expect("keyword-only dict() fast-path requires named keywords");
+                Type::string_literal(builder.db(), key.as_str())
+            } else {
+                builder.infer_expression(elt, tcx)
+            }
+        };
+
+        self.infer_collection_literal(
+            KnownClass::Dict,
+            &items,
+            &mut infer_elt_ty,
+            call_expression_tcx,
+        )
+    }
+
+    fn known_typed_dict_field_for_key(
+        &self,
+        value_type: Type<'db>,
+        key: &str,
+    ) -> Option<(Type<'db>, bool)> {
+        match value_type {
+            Type::TypedDict(typed_dict_ty) => typed_dict_ty
+                .items(self.db())
+                .get(key)
+                .map(|field| (field.declared_ty, field.is_required())),
+            Type::Union(union) => {
+                let mut field_types = UnionBuilder::new(self.db());
+                let mut all_required = true;
+
+                for element in union.elements(self.db()) {
+                    let typed_dict_ty = element.as_typed_dict()?;
+                    let field = typed_dict_ty.items(self.db()).get(key)?;
+                    field_types.add_in_place(field.declared_ty);
+                    all_required &= field.is_required();
+                }
+
+                Some((field_types.build(), all_required))
+            }
+            _ => None,
+        }
+    }
+
+    fn infer_typed_dict_get_default(
+        &mut self,
+        default_arg: &ast::Expr,
+        field_ty: Type<'db>,
+        field_is_required: bool,
+    ) -> Type<'db> {
+        if field_is_required {
+            return self.infer_expression(default_arg, TypeContext::default());
+        }
+
+        let mut speculative_builder = self.speculate();
+        let inferred_ty =
+            speculative_builder.infer_expression(default_arg, TypeContext::new(Some(field_ty)));
+
+        if inferred_ty.is_assignable_to(self.db(), field_ty) {
+            self.extend(speculative_builder);
+            inferred_ty
+        } else {
+            speculative_builder.discard();
+            self.infer_expression(default_arg, TypeContext::default())
+        }
+    }
+
+    fn infer_known_typed_dict_get_call(
+        &mut self,
+        value_type: Type<'db>,
+        arguments: &ast::Arguments,
+    ) -> Option<Type<'db>> {
+        if !arguments.keywords.is_empty() || arguments.args.len() > 2 {
+            return None;
+        }
+
+        let first_arg = arguments.args.first()?;
+        let ast::Expr::StringLiteral(ast::ExprStringLiteral {
+            value: key_literal, ..
+        }) = first_arg
+        else {
+            return None;
+        };
+
+        let key = key_literal.to_str();
+        let (field_ty, field_is_required) = self.known_typed_dict_field_for_key(value_type, key)?;
+
+        self.infer_expression(first_arg, TypeContext::default());
+
+        let default_ty = arguments.args.get(1).map(|default_arg| {
+            self.infer_typed_dict_get_default(default_arg, field_ty, field_is_required)
+        });
+
+        Some(if field_is_required {
+            field_ty
+        } else {
+            UnionType::from_two_elements(
+                self.db(),
+                field_ty,
+                default_ty.unwrap_or_else(|| Type::none(self.db())),
+            )
+        })
+    }
+
+    fn check_typed_dict_pop_or_setdefault_call(
+        &mut self,
+        typed_dict_ty: TypedDictType<'db>,
+        method_name: &str,
+        arguments: &ast::Arguments,
+    ) -> Option<Type<'db>> {
+        let first_arg = arguments.args.first()?;
+        let ast::Expr::StringLiteral(ast::ExprStringLiteral {
+            value: key_literal, ..
+        }) = first_arg
+        else {
+            return None;
+        };
+
+        let key = key_literal.to_str();
+        let items = typed_dict_ty.items(self.db());
+
+        if let Some((_, field)) = items
+            .iter()
+            .find(|(field_name, _)| field_name.as_str() == key)
+        {
+            if method_name == "pop" && field.is_required() {
+                report_cannot_pop_required_field_on_typed_dict(
+                    &self.context,
+                    first_arg.into(),
+                    Type::TypedDict(typed_dict_ty),
+                    key,
+                );
+                return Some(Type::unknown());
+            }
+
+            return None;
+        }
+
+        let key_ty = Type::string_literal(self.db(), key);
+        report_invalid_key_on_typed_dict(
+            &self.context,
+            first_arg.into(),
+            first_arg.into(),
+            Type::TypedDict(typed_dict_ty),
+            None,
+            key_ty,
+            items,
+        );
+
+        // Return `Unknown` to prevent the overload system from generating its own error.
+        Some(Type::unknown())
+    }
+
     fn infer_call_expression_impl(
         &mut self,
         call_expression: &ast::ExprCall,
@@ -6758,41 +6972,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             arguments,
         } = call_expression;
 
-        // Fast-path dict(...) in TypedDict context: infer keyword values against fields,
-        // then validate and return the TypedDict type.
-        if let Some(tcx) = call_expression_tcx.annotation
-            && let Some(typed_dict) = tcx
-                .filter_union(self.db(), Type::is_typed_dict)
-                .as_typed_dict()
-            && callable_type
-                .as_class_literal()
-                .is_some_and(|class_literal| class_literal.is_known(self.db(), KnownClass::Dict))
-            && arguments.args.is_empty()
-            && arguments
-                .keywords
-                .iter()
-                .all(|keyword| keyword.arg.is_some())
+        if callable_type
+            .as_class_literal()
+            .is_some_and(|class_literal| class_literal.is_known(self.db(), KnownClass::Dict))
+            && let Some(ty) =
+                self.infer_keyword_only_dict_call(func, arguments, call_expression_tcx)
         {
-            let items = typed_dict.items(self.db());
-            for keyword in &arguments.keywords {
-                if let Some(arg_name) = &keyword.arg {
-                    let value_tcx = items
-                        .get(arg_name.id.as_str())
-                        .map(|field| TypeContext::new(Some(field.declared_ty)))
-                        .unwrap_or_default();
-                    self.infer_expression(&keyword.value, value_tcx);
-                }
-            }
-
-            validate_typed_dict_constructor(
-                &self.context,
-                typed_dict,
-                arguments,
-                func.as_ref().into(),
-                |expr| self.expression_type(expr),
-            );
-
-            return Type::TypedDict(typed_dict);
+            return ty;
         }
 
         // Handle 3-argument `type(name, bases, dict)`.
@@ -6873,50 +7059,22 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         if let ast::Expr::Attribute(ast::ExprAttribute { value, attr, .. }) = func.as_ref() {
             let value_type = self.expression_type(value);
 
+            if attr.id.as_str() == "get"
+                && let Some(ty) = self.infer_known_typed_dict_get_call(value_type, arguments)
+            {
+                return ty;
+            }
+
             if let Type::TypedDict(typed_dict_ty) = value_type
                 && matches!(attr.id.as_str(), "pop" | "setdefault")
                 && !arguments.args.is_empty()
-
-                // Validate the key argument for `TypedDict` methods
-                && let Some(first_arg) = arguments.args.first()
-                    && let ast::Expr::StringLiteral(ast::ExprStringLiteral {
-                        value: key_literal,
-                        ..
-                    }) = first_arg
+                && let Some(ty) = self.check_typed_dict_pop_or_setdefault_call(
+                    typed_dict_ty,
+                    attr.id.as_str(),
+                    arguments,
+                )
             {
-                let key = key_literal.to_str();
-                let items = typed_dict_ty.items(self.db());
-
-                // Check if key exists
-                if let Some((_, field)) = items
-                    .iter()
-                    .find(|(field_name, _)| field_name.as_str() == key)
-                {
-                    // Key exists - check if it's a `pop()` on a required field
-                    if attr.id.as_str() == "pop" && field.is_required() {
-                        report_cannot_pop_required_field_on_typed_dict(
-                            &self.context,
-                            first_arg.into(),
-                            Type::TypedDict(typed_dict_ty),
-                            key,
-                        );
-                        return Type::unknown();
-                    }
-                } else {
-                    // Key not found, report error with suggestion and return early
-                    let key_ty = Type::string_literal(self.db(), key);
-                    report_invalid_key_on_typed_dict(
-                        &self.context,
-                        first_arg.into(),
-                        first_arg.into(),
-                        Type::TypedDict(typed_dict_ty),
-                        None,
-                        key_ty,
-                        items,
-                    );
-                    // Return `Unknown` to prevent the overload system from generating its own error
-                    return Type::unknown();
-                }
+                return ty;
             }
         }
 

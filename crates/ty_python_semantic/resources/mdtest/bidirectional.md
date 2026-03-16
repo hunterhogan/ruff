@@ -76,6 +76,11 @@ def _() -> TD:
     # error: [missing-typed-dict-key] "Missing required key 'x' in TypedDict `TD` constructor"
     # error: [invalid-return-type]
     return {}
+
+paper_formats: dict[str, dict[str, float]] = dict(
+    letter={"width": 8.5, "height": 11},
+    ledger={"width": 17, "height": 11},
+)
 ```
 
 ## Propagating return type annotation
