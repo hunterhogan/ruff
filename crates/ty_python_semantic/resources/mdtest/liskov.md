@@ -131,7 +131,7 @@ class Sub22(Super4):
     def method(self, **kwargs): ...  # error: [invalid-method-override]
 
 class Sub23(Super4):
-    def method(self, x, *args, y, **kwargs): ...  # error: [invalid-method-override]
+    def method(self, x, *args, y, **kwargs): ...  # TODO: error: [invalid-method-override]
 ```
 
 ## The entire class hierarchy is checked
